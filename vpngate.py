@@ -3,7 +3,7 @@
 
 流程:
   1. 抓取 VPN Gate 原始节点（官方 API，失败回退 GitHub 镜像）
-  2. 只保留带 TCP 入口的 SSTP 节点（VPN Gate 的 TCP 端口即 SSTP 端口）
+  2. 从 VPN Gate 的 OpenVPN TCP 配置提取候选 host/port；这只是候选，不代表该端口一定提供 SSTP
   3. 去重 → 按 Ping 预排序 →（可选）截断
   4. 并发调用检测 Worker
   5. 合并静态优选域名与优选 API 端点
@@ -65,7 +65,6 @@ DEFAULT_EDGE_HOSTS = [
     "cf.877774.xyz:443",
     "cwww.leics.police.uk:443",
     "cf.itv888.cn:443",
-    "example.com:443",
     "cdn.sketch.com:443",
 ]
 
@@ -289,9 +288,8 @@ class Config:
     def load(cls) -> "Config":
         raw_worker = os.environ.get("CHECK_WORKER", "").strip()
         if not raw_worker:
-            domain = os.environ.get("DOMAIN", "").strip()
-            if domain:
-                raw_worker = f"https://{domain}/check?sstp=vpn:vpn@"
+            domain = os.environ.get("DOMAIN", "").strip() or "fg2013.hazhen.dpdns.org"
+            raw_worker = f"https://{domain}/check?sstp=vpn:vpn@"
         worker_base = normalize_worker_base(raw_worker)
 
         static_raw = os.environ.get("HOSTS_ENTRY", "").strip()
@@ -516,6 +514,7 @@ class Node:
 
 
 def to_sstp_nodes(rows: Iterable[dict[str, Any]]) -> list[Node]:
+    """提取 TCP 候选端点。OpenVPN TCP 配置不等于 SSTP 服务证明，最终以 Worker 握手检测为准。"""
     nodes: list[Node] = []
     for row in rows:
         config_b64 = row.get("config_b64") or ""
@@ -629,7 +628,11 @@ def check_one(
         success = bool(payload.get("success"))
         result["success"] = success
         result["status"] = "success" if success else "failed"
-        result["latency_ms"] = payload.get("responseTime")
+        raw_latency = payload.get("responseTime")
+        result["latency_ms"] = (
+            float(raw_latency) if isinstance(raw_latency, (int, float))
+            and not isinstance(raw_latency, bool) and raw_latency >= 0 else None
+        )
         result["colo"] = payload.get("colo")
         result["error"] = None if success else (
             payload.get("error") or payload.get("message") or "check failed"
@@ -946,7 +949,7 @@ def main() -> None:
     if cfg.max_check_nodes > 0:
         unique_nodes = unique_nodes[: cfg.max_check_nodes]
 
-    log("VPN GATE", f"原始节点 {raw_count}, SSTP {sstp_count}, 去重后 {len(unique_nodes)}")
+    log("VPN GATE", f"原始节点 {raw_count}, TCP 候选 {sstp_count}（尚未证明支持 SSTP）, 去重后 {len(unique_nodes)}")
     log("CLOUDFLARE WORKER", f"提交检测: {len(unique_nodes)}")
 
     check_started = time.time()
