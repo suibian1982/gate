@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Gate 自动化家宽节点抓取与检测流水线 (小何爱分享架构专版)
+VPN Gate 自动化家宽节点抓取与检测流水线 (语法修复版)
 ================================================================
 通过 Cloudflare Worker (CheckSocks5) 远程检测节点，自动生成 nodes.txt。
 """
@@ -16,6 +16,7 @@ import re
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
@@ -28,7 +29,6 @@ for _stream in (sys.stdout, sys.stderr):
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 稳定镜像源
 VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
@@ -37,7 +37,6 @@ VPNGATE_MIRROR = os.environ.get(
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 
-# 获取 GitHub Secrets 中配置的 DOMAIN (即 CheckSocks5 Worker 的域名，形如 check.xxx.workers.dev)
 CHECK_WORKER_HOST = os.environ.get("DOMAIN", "").strip()
 
 COUNTRY_ZH = {
@@ -196,7 +195,6 @@ def dedupe(nodes):
     return out
 
 def check_one_via_worker(node):
-    """通过 CheckSocks5 Worker 检测节点连通性及属性"""
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
@@ -204,7 +202,6 @@ def check_one_via_worker(node):
     out["residential"] = "datacenter"
     
     if not CHECK_WORKER_HOST:
-        # 如果没有配置 DOMAIN 密钥，默认退化为本地直测
         return check_local_fallback(node)
 
     check_url = f"https://{CHECK_WORKER_HOST}/check?lastp=vpn:vpn@{node['host']}:{node['port']}"
@@ -215,7 +212,6 @@ def check_one_via_worker(node):
             if res_json.get("success") is True:
                 out["success"] = True
                 out["latency_ms"] = res_json.get("responseTime", 100)
-                # 判断是否为家宽机房
                 exit_info = res_json.get("exit", {})
                 if exit_info.get("is_datacenter") is False:
                     out["residential"] = "residential"
@@ -227,7 +223,6 @@ def check_one_via_worker(node):
         return out
 
 def check_local_fallback(node):
-    """本地 TCP 回退检测"""
     out = dict(node)
     out["success"] = False
     out["residential"] = "residential"
@@ -250,9 +245,6 @@ def check_all(nodes):
         for fut in as_completed(futures):
             results.append(fut.result())
     return results
-
-# 引入线程池导入
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def build_outputs(results, raw_count, sstp_count, source, duration_s):
     available = [r for r in results if r.get("success")]
@@ -309,8 +301,8 @@ def build_nodes_text(data, edge_hosts):
             n.get("latency_ms") or 0,
             n.get("host") or ""
         ))
-        res_nodes = [n for n in nodes if n.get("residential"] == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential"] != "residential"]
+        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
+        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
         for i, n in enumerate(res_nodes, 1):
             if edge:
                 entry = edge[idx % len(edge)]
@@ -391,7 +383,7 @@ def main():
     raw_count = len(rows)
     if raw_count == 0: die("VPN Gate 返回 0 个有效原始节点")
 
-    sstp_nodes = to_stp_nodes_custom(rows) if 'to_stp_nodes_custom' in globals() else to_sstp_nodes(rows)
+    sstp_nodes = to_sstp_nodes(rows)
     sstp_count = len(sstp_nodes)
     if sstp_count == 0: die("未解析出任何 SSTP 节点")
     uniq = dedupe(sstp_nodes)
