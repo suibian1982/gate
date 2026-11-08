@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Gate SSTP 节点检测流水线 (强日志诊断版)
+VPN Gate SSTP 节点检测流水线 (504 超时防御修复版)
 =========================================================
 """
 
@@ -38,7 +38,6 @@ VPNGATE_MIRROR = os.environ.get(
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "64")))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "6.0"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
-HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "30"))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 
@@ -97,26 +96,28 @@ def die(msg):
     sys.exit(1)
 
 def fetch_vpngate():
+    # 1. 尝试官方 API (设置短超时 10 秒，防止 504 挂起卡死)
     try:
         log("VPN GATE", f"正在请求官方 API: {VPNGATE_API}")
         resp = requests.get(
             VPNGATE_API,
-            timeout=HTTP_TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"}
         )
-        log("VPN GATE", f"官方 API 响应状态码: {resp.status_code}, 长度: {len(resp.text)}")
-        if resp.status_code == 200 and len(resp.text) > 100:
+        if resp.status_code == 200 and "HostName" in resp.text:
             rows = parse_csv(resp.text)
             if rows:
-                log("VPN GATE", f"官方 API 获取并解析成功，共 {len(rows)} 个节点")
+                log("VPN GATE", f"官方 API 获取成功，共 {len(rows)} 个节点")
                 return rows, "vpngate.net/api/iphone"
+        else:
+            log("VPN GATE", f"官方 API 响应异常或超时 (Status: {resp.status_code})，准备切换镜像")
     except Exception as exc:
-        log("VPN GATE", f"官方 API 请求异常: {exc}")
+        log("VPN GATE", f"官方 API 请求超时/失败: {exc}，自动切换至备用镜像源")
 
+    # 2. 强制切换到备用镜像源 (绝对可靠)
     try:
-        log("VPN GATE", f"切换至备用镜像源: {VPNGATE_MIRROR}")
-        resp = requests.get(VPNGATE_MIRROR, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
-        log("VPN GATE", f"备用镜像响应状态码: {resp.status_code}")
+        log("VPN GATE", f"正在请求备用镜像源: {VPNGATE_MIRROR}")
+        resp = requests.get(VPNGATE_MIRROR, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code == 200:
             data = resp.json()
             rows = parse_mirror_json(data)
@@ -126,7 +127,7 @@ def fetch_vpngate():
     except Exception as exc:
         log("VPN GATE", f"备用镜像请求异常: {exc}")
 
-    die("所有数据源（官方 API 与备用镜像）均获取失败。")
+    die("所有数据源（官方 API 504 超时与备用镜像）均获取失败。")
 
 def parse_csv(text):
     lines = [ln for ln in text.splitlines() if ln.strip()]
@@ -136,7 +137,6 @@ def parse_csv(text):
             header_idx = i
             break
     if header_idx is None:
-        log("PARSE CSV", "警告: 未在 CSV 中找到 HostName 表头")
         return []
 
     header = lines[header_idx].lstrip("#").split(",")
@@ -336,7 +336,7 @@ def build_nodes_text(data, edge_hosts):
             n.get("host") or ""
         ))
         res_nodes = [n for n in nodes if n.get("residential") == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential"] != "residential"]
+        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
         for i, n in enumerate(res_nodes, 1):
             if edge:
                 entry = edge[idx % len(edge)]
