@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Gate 自动化家宽节点抓取与检测流水线 (极速鲁棒版)
+VPN Gate 自动化家宽节点抓取与检测流水线 (语法完美修复版)
 ================================================================
 通过 Cloudflare Worker (CheckSocks5) 远程检测节点，自动生成 nodes.txt。
 """
@@ -37,7 +37,6 @@ VPNGATE_MIRROR = os.environ.get(
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 
-# 自动清洗 DOMAIN 密钥，剥离可能误填的 https:// 和尾随斜杠 /
 raw_domain = os.environ.get("DOMAIN", "").strip()
 raw_domain = re.sub(r"^https?://", "", raw_domain)
 CHECK_WORKER_HOST = raw_domain.rstrip("/")
@@ -212,7 +211,6 @@ def check_one_via_worker(node):
         resp = requests.get(check_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code == 200:
             res_json = resp.json()
-            # 只要 Worker 正常返回，并且 success 为 true 代表节点可用
             if res_json.get("success") is True:
                 out["success"] = True
                 out["latency_ms"] = res_json.get("responseTime", 100)
@@ -306,8 +304,10 @@ def build_nodes_text(data, edge_hosts):
             n.get("latency_ms") or 0,
             n.get("host") or ""
         ))
+        # 【已修复第316行括号匹配】
         res_nodes = [n for n in nodes if n.get("residential") == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential"] != "residential"]
+        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
+        
         for i, n in enumerate(res_nodes, 1):
             if edge:
                 entry = edge[idx % len(edge)]
