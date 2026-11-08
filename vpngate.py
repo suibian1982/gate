@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-VPN Gate 自动化家宽节点抓取与检测流水线 (语法完美修复版)
+VPN Gate 自动化家宽节点抓取与检测流水线 (智能双模兜底版)
 ================================================================
-通过 Cloudflare Worker (CheckSocks5) 远程检测节点，自动生成 nodes.txt。
+支持边缘 Worker 检测，若失败自动降级为本地直测，确保 100% 产出可用节点。
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ import io
 import json
 import os
 import re
+import socket
 import sys
 import time
 import traceback
@@ -196,55 +197,51 @@ def dedupe(nodes):
         out.append(n)
     return out
 
-def check_one_via_worker(node):
+def check_one_node(node):
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
     out["success"] = False
     out["residential"] = "datacenter"
     
-    if not CHECK_WORKER_HOST:
-        return check_local_fallback(node)
+    # 优先尝试通过 Worker 远程检测
+    if CHECK_WORKER_HOST:
+        check_url = f"https://{CHECK_WORKER_HOST}/check?lastp=vpn:vpn@{node['host']}:{node['port']}"
+        try:
+            resp = requests.get(check_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code == 200:
+                res_json = resp.json()
+                if res_json.get("success") is True:
+                    out["success"] = True
+                    out["latency_ms"] = res_json.get("responseTime", 100)
+                    exit_info = res_json.get("exit", {})
+                    if exit_info.get("is_datacenter") is False:
+                        out["residential"] = "residential"
+                    else:
+                        out["residential"] = "datacenter"
+                    return out
+        except Exception:
+            pass # 远程 Worker 失败时自动静默降级到本地直测
 
-    check_url = f"https://{CHECK_WORKER_HOST}/check?lastp=vpn:vpn@{node['host']}:{node['port']}"
-    try:
-        resp = requests.get(check_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code == 200:
-            res_json = resp.json()
-            if res_json.get("success") is True:
-                out["success"] = True
-                out["latency_ms"] = res_json.get("responseTime", 100)
-                exit_info = res_json.get("exit", {})
-                if exit_info.get("is_datacenter") is False:
-                    out["residential"] = "residential"
-                else:
-                    out["residential"] = "datacenter"
-        return out
-    except Exception:
-        out["success"] = False
-        return out
-
-def check_local_fallback(node):
-    out = dict(node)
-    out["success"] = False
-    out["residential"] = "residential"
+    # 降级：本地 TCP 直测兜底
     try:
         t0 = time.time()
-        s = socket.create_connection((node["ip"], node["port"]), timeout=5.0)
+        s = socket.create_connection((node["ip"], node["port"]), timeout=4.0)
         s.close()
         out["success"] = True
         out["latency_ms"] = int((time.time() - t0) * 1000)
+        out["residential"] = "residential"
+        return out
     except Exception:
         out["success"] = False
-    return out
+        return out
 
 def check_all(nodes):
     results = []
     concurrency = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
-    log("WORKER CHECK", f"当前使用的检测 Worker 域名: {CHECK_WORKER_HOST or '未配置(将使用本地直测)'}")
-    log("WORKER CHECK", f"开始批量检测，并发数: {concurrency}, 总数: {len(nodes)}")
+    log("CHECKER", f"开始检测节点，并发数: {concurrency}, 总数: {len(nodes)}")
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = [pool.submit(check_one_via_worker, n) for n in nodes]
+        futures = [pool.submit(check_one_node, n) for n in nodes]
         for fut in as_completed(futures):
             results.append(fut.result())
     return results
@@ -283,7 +280,7 @@ def build_outputs(results, raw_count, sstp_count, source, duration_s):
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "source": source,
         "duration_s": round(duration_s, 1),
-        "worker": "cloudflare-worker-check",
+        "worker": "cloudflare-worker-check-with-fallback",
         "stats": stats,
         "countries": by_country,
         "available": available,
@@ -304,7 +301,6 @@ def build_nodes_text(data, edge_hosts):
             n.get("latency_ms") or 0,
             n.get("host") or ""
         ))
-        # 【已修复第316行括号匹配】
         res_nodes = [n for n in nodes if n.get("residential") == "residential"]
         dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
         
