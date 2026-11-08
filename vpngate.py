@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
-VPN Gate SSTP 节点检测流水线 (Python原生TCP检测 + Pages修复版)
+VPN Gate SSTP 节点检测流水线 (完美融合版)
 =========================================================
+融合了旧版能正常测速的本地 TCP 检测机制与新版的容灾、原子写入与优选 API。
 """
+
+from __future__ import annotations
 
 import base64
 import csv
@@ -64,7 +67,7 @@ COUNTRY_ZH = {
     "AT": "奥地利", "HU": "匈牙利", "AR": "阿根廷", "CL": "智利", "CO": "哥伦比亚",
     "NZ": "新西兰", "ZA": "南非", "IL": "以色列", "AE": "阿联酋", "SA": "沙特",
     "EG": "埃及", "HR": "克罗地亚", "BY": "白俄罗斯", "GD": "格林纳达",
-    "LV": "拉脱维亚", "EE": "爱沙尼亚", "LT": "立拓宛", "SK": "斯洛伐克",
+    "LV": "拉脱维亚", "EE": "爱沙尼亚", "LT": "立陶宛", "SK": "斯洛伐克",
     "SI": "斯洛文尼亚", "BG": "保加利亚", "RS": "塞尔维亚", "GE": "格鲁吉亚",
     "MD": "摩尔多瓦", "AM": "亚美尼亚", "KZ": "哈萨克斯坦", "UZ": "乌兹别克斯坦",
     "MN": "蒙古", "NP": "尼泊尔", "LK": "斯里兰卡", "MM": "缅甸",
@@ -357,8 +360,8 @@ def build_nodes_text(data, edge_hosts):
             n.get("latency_ms") or 0,
             n.get("host") or ""
         ))
-        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
+        res_nodes = [n for n in nodes if n.get("residential"] == "residential"]
+        dc_nodes = [n for n in nodes if n.get("residential"] != "residential"]
         for i, n in enumerate(res_nodes, 1):
             entry = edge[idx % len(edge)]
             idx += 1
@@ -369,15 +372,19 @@ def build_nodes_text(data, edge_hosts):
             lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
     return "\n".join(lines) + "\n"
 
+def atomic_write(path, text):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp_path = f"{path}.tmp-{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp_path, path)
+
 def write_outputs(data, edge_hosts):
     os.makedirs(PUBLIC_DIR, exist_ok=True)
-
-    # 自动创建空的 .nojekyll 文件，强制 GitHub Pages 关闭 Jekyll 静态构建引擎，解决 404 问题
-    open(os.path.join(PUBLIC_DIR, ".nojekyll"), "w").close()
+    atomic_write(os.path.join(PUBLIC_DIR, ".nojekyll"), "")
 
     data_path = os.path.join(PUBLIC_DIR, "data.json")
-    with open(data_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=1)
+    atomic_write(data_path, json.dumps(data, ensure_ascii=False, indent=1))
 
     html_path = os.path.join(PUBLIC_DIR, "index.html")
     if os.path.exists(TEMPLATE_HTML):
@@ -385,12 +392,11 @@ def write_outputs(data, edge_hosts):
             html = f.read()
     else:
         html = "<html><head><meta charset='utf-8'><title>VPN Gate SSTP 节点</title></head><body><h1>VPN Gate SSTP 节点</h1></body></html>"
-    with open(html_path, "w", encoding="utf-8") as f:
-        f.write(html)
+    atomic_write(html_path, html)
 
     nodes_path = os.path.join(PUBLIC_DIR, "nodes.txt")
-    with open(nodes_path, "w", encoding="utf-8") as f:
-        f.write(build_nodes_text(data, edge_hosts))
+    nodes_text = build_nodes_text(data, edge_hosts)
+    atomic_write(nodes_path, nodes_text)
 
     return data_path, html_path, nodes_path
 
