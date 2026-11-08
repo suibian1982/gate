@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-VPN Gate SSTP 节点检测流水线 (集成全功能摘要表格)
+VPN Gate SSTP 节点检测流水线 (高容错稳健版)
 =========================================================
-基于本地 TCP 端口直测，自动输出完整的 GitHub Actions 运行摘要 Markdown 表格。
 """
 
 from __future__ import annotations
@@ -38,22 +37,9 @@ VPNGATE_MIRROR = os.environ.get(
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "64")))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "6.0"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
-HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
+HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "30"))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
-
-DATA_CENTER_ORG_KEYWORDS = [
-    "GOOGLE", "AMAZON", "AWS", "MICROSOFT", "OVH", "HETZNER", "DIGITALOCEAN",
-    "AKAMAI", "CLOUDFLARE", "FASTLY", "RACKSPACE", "EQUINIX", "LINODE", "VULTR",
-    "HURRICANE", "TENCENT", "ALIBABA", "ALIYUN", "LEASEWEB",
-]
-RESIDENTIAL_ORG_KEYWORDS = [
-    "NTT EAST", "NTT WEST", "NTT COMMUNICATIONS", "NTT BROADBAND", "KDDI", "DOCOMO",
-    "SOFTBANK", "AU COMMUNICATIONS", "J:COM", "JCOM", "OCN", "BIGLOBE",
-    "IIJ", "SEIKO", "CLEVER-NET", "AT&T", "COMCAST", "XFINITY", "VERIZON",
-    "TELUS", "ROGERS", "BELL CANADA", "VODAFONE", "ORANGE", "DEUTSCHE TELEKOM",
-    "BREEZE", "TIM S.P.A", "LIBERO", "FASTWEB", "FREE FRANCE", "BT OPEN",
-]
 
 COUNTRY_ZH = {
     "JP": "日本", "KR": "韩国", "US": "美国", "CA": "加拿大", "RU": "俄罗斯",
@@ -109,29 +95,37 @@ def die(msg):
     sys.exit(1)
 
 def fetch_vpngate():
+    # 1. 尝试官方 API
     try:
-        log("VPN GATE", f"获取官方 API: {VPNGATE_API}")
-        resp = requests.get(VPNGATE_API, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (compatible; gate-checker)"})
-        resp.raise_for_status()
-        rows = parse_csv(resp.text)
-        if rows:
-            log("VPN GATE", f"主源(官方 API) 获取到 {len(rows)} 个原始节点")
-            return rows, "vpngate.net/api/iphone"
-        raise RuntimeError("官方 API 返回 0 行数据")
+        log("VPN GATE", f"正在请求官方 API: {VPNGATE_API}")
+        resp = requests.get(
+            VPNGATE_API,
+            timeout=HTTP_TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        )
+        if resp.status_code == 200 and "HostName" in resp.text:
+            rows = parse_csv(resp.text)
+            if rows:
+                log("VPN GATE", f"官方 API 获取并解析成功，共 {len(rows)} 个节点")
+                return rows, "vpngate.net/api/iphone"
+        else:
+            log("VPN GATE", f"官方 API 返回异常状态码或非 CSV 数据 (Status: {resp.status_code})")
     except Exception as exc:
-        log("VPN GATE", f"官方 API 获取失败: {exc}")
+        log("VPN GATE", f"官方 API 请求异常: {exc}")
 
+    # 2. 尝试备用镜像源
     try:
-        log("VPN GATE", f"回退镜像: {VPNGATE_MIRROR}")
+        log("VPN GATE", f"切换至备用镜像源: {VPNGATE_MIRROR}")
         resp = requests.get(VPNGATE_MIRROR, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
-        resp.raise_for_status()
-        rows = parse_mirror_json(resp.json())
-        if rows:
-            log("VPN GATE", f"回退源(镜像) 获取到 {len(rows)} 个原始节点")
-            return rows, "github-mirror"
+        if resp.status_code == 200:
+            rows = parse_mirror_json(resp.json())
+            if rows:
+                log("VPN GATE", f"备用镜像获取成功，共 {len(rows)} 个节点")
+                return rows, "github-mirror"
     except Exception as exc:
-        log("VPN GATE", f"回退镜像也失败: {exc}")
-    die("VPN Gate 官方 API 与回退镜像均不可用, 数据源完全失败")
+        log("VPN GATE", f"备用镜像请求异常: {exc}")
+
+    die("所有数据源（官方 API 与备用镜像）均获取失败，请检查网络或稍后重试。")
 
 def parse_csv(text):
     lines = [ln for ln in text.splitlines() if ln.strip()]
@@ -141,7 +135,7 @@ def parse_csv(text):
             header_idx = i
             break
     if header_idx is None:
-        raise RuntimeError("找不到 CSV 表头行 (HostName)")
+        return []
 
     header = lines[header_idx].lstrip("#").split(",")
     data_lines = lines[header_idx + 1:]
@@ -161,4 +155,147 @@ def parse_csv(text):
         "ip": idx.get("ip", 1),
         "countrylong": idx.get("countrylong", 5),
         "countryshort": idx.get("countryshort", 6),
-        "openvpn_configdata_base64": idx.get("openvpn_configdata_base64", len(header) -
+        "openvpn_configdata_base64": idx.get("openvpn_configdata_base64", len(header) - 1),
+    }
+
+    rows = []
+    for ln in data_lines:
+        try:
+            fields = next(csv.reader(io.StringIO(ln)))
+        except Exception:
+            continue
+        if len(fields) < 7: continue
+        host = fields[pos["hostname"]].strip()
+        ip = fields[pos["ip"]].strip()
+        if not host or not ip: continue
+        rows.append({
+            "host": host,
+            "ip": ip,
+            "country_long": fields[pos["countrylong"]].strip(),
+            "country_short": fields[pos["countryshort"]].strip(),
+            "config_b64": fields[pos["openvpn_configdata_base64"]].strip(),
+        })
+    return rows
+
+def parse_mirror_json(data):
+    servers = []
+    items = data if isinstance(data, list) else [data]
+    for item in items:
+        if isinstance(item, dict) and isinstance(item.get("servers"), list):
+            servers.extend(item["servers"])
+        elif isinstance(item, dict):
+            servers.append(item)
+    rows = []
+    for s in servers:
+        host = str(s.get("hostname") or s.get("host") or "").strip()
+        ip = str(s.get("ip") or "").strip()
+        if not host or not ip: continue
+        rows.append({
+            "host": host,
+            "ip": ip,
+            "country_long": str(s.get("countrylong") or s.get("country_long") or s.get("country") or "").strip(),
+            "country_short": str(s.get("countryshort") or s.get("country_short") or "").strip(),
+            "config_b64": str(s.get("openvpn_configdata_base64") or s.get("config_b64") or "").strip(),
+        })
+    return rows
+
+_PROTO_TCP_RE = re.compile(r"^proto\s+(tcp|tcp4|tcp6)\b", re.M)
+_REMOTE_RE = re.compile(r"^remote\s+\S+\s+(\d+)", re.M)
+
+def to_sstp_nodes(rows):
+    nodes = []
+    for r in rows:
+        cfg = ""
+        if r["config_b64"]:
+            try:
+                cfg = base64.b64decode(r["config_b64"], validate=False).decode("utf-8", "replace")
+            except Exception:
+                cfg = ""
+        if not _PROTO_TCP_RE.search(cfg): continue
+        m = _REMOTE_RE.search(cfg)
+        if not m: continue
+        port = int(m.group(1))
+        if not (1 <= port <= 65535): continue
+        host = r["host"]
+        if not host.endswith(".opengw.net"):
+            host = f"{host}.opengw.net"
+        nodes.append({"host": host, "port": port, "ip": r["ip"], "country": r["country_long"], "country_code": r["country_short"]})
+    return nodes
+
+def dedupe(nodes):
+    seen = set()
+    out = []
+    for n in nodes:
+        key = (n["host"].lower(), n["port"], "sstp")
+        if key in seen: continue
+        seen.add(key)
+        out.append(n)
+    return out
+
+def classify_network(host):
+    h = host.lower()
+    if h.startswith("public-vpn"): return "datacenter"
+    if re.match(r"^vpn\d{5,}", h) or re.match(r"^vpnv\d+", h): return "residential"
+    return "residential"
+
+def check_one(node):
+    out = dict(node)
+    out["protocol"] = "sstp"
+    out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
+    out["status"] = "failed"
+    out["success"] = False
+    out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    out["exit"] = None
+    out["residential"] = classify_network(node["host"])
+    
+    target_ip = node["ip"]
+    target_port = node["port"]
+    
+    t0 = time.time()
+    try:
+        s = socket.create_connection((target_ip, target_port), timeout=CHECK_TIMEOUT)
+        s.close()
+        latency = int((time.time() - t0) * 1000)
+        
+        out["success"] = True
+        out["status"] = "success"
+        out["latency_ms"] = latency
+        out["error"] = None
+    except Exception as exc:
+        out["success"] = False
+        out["status"] = "failed"
+        out["error"] = str(exc)
+    
+    return out
+
+def check_all(nodes):
+    results = []
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        futures = [pool.submit(check_one, n) for n in nodes]
+        for fut in as_completed(futures):
+            results.append(fut.result())
+    return results
+
+def build_outputs(results, raw_count, sstp_count, source, duration_s):
+    available = [r for r in results if r.get("success")]
+    countries = {}
+    for n in available:
+        c = n["country"] or "未知"
+        code = n["country_code"] or "?"
+        countries.setdefault(c, {"code": code, "name": c, "nodes": []})["nodes"].append(n)
+
+    stats = {
+        "raw_nodes": raw_count,
+        "sstp_nodes": sstp_count,
+        "checked": len(results),
+        "success": len(available),
+        "failed": len(results) - len(available),
+        "countries": len(countries),
+        "residential_est": sum(1 for n in available if n.get("residential") == "residential"),
+        "datacenter_est": sum(1 for n in available if n.get("residential") == "datacenter"),
+    }
+    by_country = {}
+    for name, grp in countries.items():
+        grp["count"] = len(grp["nodes"])
+        grp["residential"] = sum(1 for n in grp["nodes"] if n.get("residential") == "residential")
+        grp["datacenter"] = sum(1 for n in grp["nodes
