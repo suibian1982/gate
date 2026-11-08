@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-VPN Gate SSTP 节点检测流水线 (完美修复版)
+VPN Gate SSTP 节点检测流水线 (完美恢复摘要报告版)
 =========================================================
+融合了本地高效 TCP 检测、多源容灾、原子写入以及 GitHub Actions 运行摘要表格报告。
 """
 
 from __future__ import annotations
@@ -44,7 +45,7 @@ TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 DATA_CENTER_ORG_KEYWORDS = [
     "GOOGLE", "AMAZON", "AWS", "MICROSOFT", "OVH", "HETZNER", "DIGITALOCEAN",
     "AKAMAI", "CLOUDFLARE", "FASTLY", "RACKSPACE", "EQUINIX", "LINODE", "VULTR",
-    "HURRICANE", "TENCENT", "ALIBABA", "ALIYUN", "LEASWEB",
+    "HURRICANE", "TENCENT", "ALIBABA", "ALIYUN", "LEASEWEB",
 ]
 RESIDENTIAL_ORG_KEYWORDS = [
     "NTT EAST", "NTT WEST", "NTT COMMUNICATIONS", "NTT BROADBAND", "KDDI", "DOCOMO",
@@ -79,7 +80,19 @@ EDGE_HOSTS = [
 ]
 
 OPTIMAL_API = os.environ.get("OPTIMAL_API", "https://cf.090227.xyz/ct?ips=6&port=443")
-NODES_URL = os.environ.get("NODES_URL", "https://guozj1982.github.io/gate/nodes.txt")
+
+def derive_nodes_url() -> str:
+    explicit = os.environ.get("NODES_URL", "").strip()
+    if explicit:
+        return explicit
+    repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
+    if "/" in repo:
+        owner, name = repo.split("/", 1)
+        if owner and name:
+            return f"https://{owner}.github.io/{name}/nodes.txt"
+    return "https://<owner>.github.io/<repo>/nodes.txt"
+
+NODES_URL = derive_nodes_url()
 
 _section = None
 
@@ -254,17 +267,11 @@ def dedupe(nodes):
         out.append(n)
     return out
 
-def classify_network(host, exit_org, is_datacenter=None):
-    if is_datacenter is True: return "datacenter"
-    if is_datacenter is False: return "residential"
-    org = (exit_org or "").upper()
-    if org:
-        if any(k in org for k in DATA_CENTER_ORG_KEYWORDS): return "datacenter"
-        if any(k in org for k in RESIDENTIAL_ORG_KEYWORDS): return "residential"
+def classify_network(host):
     h = host.lower()
     if h.startswith("public-vpn"): return "datacenter"
     if re.match(r"^vpn\d{5,}", h) or re.match(r"^vpnv\d+", h): return "residential"
-    return "unknown"
+    return "residential"
 
 def check_one(node):
     out = dict(node)
@@ -274,7 +281,7 @@ def check_one(node):
     out["success"] = False
     out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     out["exit"] = None
-    out["residential"] = classify_network(node["host"], None, None)
+    out["residential"] = classify_network(node["host"])
     
     target_ip = node["ip"]
     target_port = node["port"]
@@ -304,12 +311,13 @@ def check_all(nodes):
             results.append(fut.result())
     return results
 
-def build_outputs(results, raw_count, sstp_count, source):
+def build_outputs(results, raw_count, sstp_count, source, duration_s):
     available = [r for r in results if r.get("success")]
     countries = {}
     for n in available:
         c = n["country"] or "未知"
-        countries.setdefault(c, {"code": n["country_code"] or "?", "nodes": []})["nodes"].append(n)
+        code = n["country_code"] or "?"
+        countries.setdefault(c, {"code": code, "name": c, "nodes": []})["nodes"].append(n)
 
     stats = {
         "raw_nodes": raw_count,
@@ -337,6 +345,7 @@ def build_outputs(results, raw_count, sstp_count, source):
     data = {
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "source": source,
+        "duration_s": round(duration_s, 1),
         "worker": "python-native-tcp-check",
         "stats": stats,
         "countries": by_country,
@@ -378,6 +387,36 @@ def atomic_write(path, text):
         f.write(text)
     os.replace(tmp_path, path)
 
+def write_step_summary(data, nodes_count):
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
+    if not summary_path:
+        return
+    stats = data["stats"]
+    rows = [
+        "## check 摘要\n\n",
+        "| 指标 | 数值 |\n| :--- | ---: |\n",
+        f"| 原始节点 | {stats['raw_nodes']} |\n",
+        f"| SSTP 候选 | {stats['sstp_nodes']} |\n",
+        f"| 已检测 | {stats['checked']} |\n",
+        f"| 可用 | {stats['success']} |\n",
+        f"| 失败 | {stats['failed']}（Worker 异常 0）|\n",
+        f"| 国家/地区 | {stats['countries']} |\n",
+        f"| 住宅 / 机房 / 未知 | {stats['residential_est']} / {stats['datacenter_est']} / 0 |\n",
+        f"| 发布节点行数 | {nodes_count} |\n",
+        f"| 用时 | {data['duration_s']}s |\n",
+        f"| 数据源 | {data['source']} |\n",
+    ]
+    top = sorted(data["countries"].values(), key=lambda g: -g["count"])[:5]
+    if top:
+        rows.append("\n**节点最多的 5 个国家/地区**\n\n| 国家/地区 | 数量 | 住宅 |\n| :--- | ---: | ---: |\n")
+        for group in top:
+            c_code = group.get('code', '')
+            c_name = COUNTRY_ZH.get(c_code, group['name'])
+            rows.append(f"| {c_name} （{c_code}）| {group['count']} | {group['residential']} |\n")
+    rows.append(f"\n订阅地址：`{NODES_URL}`\n")
+    with open(summary_path, "a", encoding="utf-8") as f:
+        f.write("".join(rows))
+
 def write_outputs(data, edge_hosts):
     os.makedirs(PUBLIC_DIR, exist_ok=True)
     atomic_write(os.path.join(PUBLIC_DIR, ".nojekyll"), "")
@@ -397,9 +436,10 @@ def write_outputs(data, edge_hosts):
     nodes_text = build_nodes_text(data, edge_hosts)
     atomic_write(nodes_path, nodes_text)
 
-    return data_path, html_path, nodes_path
+    return data_path, html_path, nodes_path, nodes_text
 
 def main():
+    started = time.time()
     rows, source = fetch_vpngate()
     raw_count = len(rows)
     if raw_count == 0: die("VPN Gate 返回 0 个原始节点")
@@ -419,9 +459,13 @@ def main():
 
     log("TCP CHECK", f"检测成功: {len(success)}, 检测失败: {len(failed)}")
 
-    data = build_outputs(results, raw_count, sstp_count, source)
+    duration_s = time.time() - started
+    data = build_outputs(results, raw_count, sstp_count, source, duration_s)
     edge_hosts = get_combined_edge_hosts()
-    write_outputs(data, edge_hosts)
+    data_path, html_path, nodes_path, nodes_text = write_outputs(data, edge_hosts)
+    
+    nodes_count = len([line for line in nodes_text.splitlines() if line.strip()])
+    write_step_summary(data, nodes_count)
     log("WEBSITE", "完成文件生成与打包发布")
 
 if __name__ == "__main__":
