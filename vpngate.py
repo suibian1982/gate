@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Gate SSTP 节点检测流水线 (504 超时防御修复版)
+VPN Gate SSTP 节点检测流水线 (强制镜像稳定版)
 =========================================================
 """
 
@@ -29,7 +29,6 @@ for _stream in (sys.stdout, sys.stderr):
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
-VPNGATE_API = os.environ.get("VPNGATE_API", "http://www.vpngate.net/api/iphone/")
 VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
@@ -96,88 +95,22 @@ def die(msg):
     sys.exit(1)
 
 def fetch_vpngate():
-    # 1. 尝试官方 API (设置短超时 10 秒，防止 504 挂起卡死)
+    # 强制直接从稳定的 GitHub 镜像源获取数据，彻底规避官方 API 504 崩溃
     try:
-        log("VPN GATE", f"正在请求官方 API: {VPNGATE_API}")
-        resp = requests.get(
-            VPNGATE_API,
-            timeout=10,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        if resp.status_code == 200 and "HostName" in resp.text:
-            rows = parse_csv(resp.text)
-            if rows:
-                log("VPN GATE", f"官方 API 获取成功，共 {len(rows)} 个节点")
-                return rows, "vpngate.net/api/iphone"
-        else:
-            log("VPN GATE", f"官方 API 响应异常或超时 (Status: {resp.status_code})，准备切换镜像")
-    except Exception as exc:
-        log("VPN GATE", f"官方 API 请求超时/失败: {exc}，自动切换至备用镜像源")
-
-    # 2. 强制切换到备用镜像源 (绝对可靠)
-    try:
-        log("VPN GATE", f"正在请求备用镜像源: {VPNGATE_MIRROR}")
-        resp = requests.get(VPNGATE_MIRROR, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        log("VPN GATE", f"正在请求稳定镜像源: {VPNGATE_MIRROR}")
+        resp = requests.get(VPNGATE_MIRROR, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code == 200:
             data = resp.json()
             rows = parse_mirror_json(data)
             if rows:
-                log("VPN GATE", f"备用镜像获取成功，共 {len(rows)} 个节点")
+                log("VPN GATE", f"镜像源获取并解析成功，共 {len(rows)} 个原始节点")
                 return rows, "github-mirror"
+        else:
+            log("VPN GATE", f"镜像源响应异常 (Status: {resp.status_code})")
     except Exception as exc:
-        log("VPN GATE", f"备用镜像请求异常: {exc}")
+        log("VPN GATE", f"镜像源请求异常: {exc}")
 
-    die("所有数据源（官方 API 504 超时与备用镜像）均获取失败。")
-
-def parse_csv(text):
-    lines = [ln for ln in text.splitlines() if ln.strip()]
-    header_idx = None
-    for i, ln in enumerate(lines):
-        if ln.lstrip("#").startswith("HostName"):
-            header_idx = i
-            break
-    if header_idx is None:
-        return []
-
-    header = lines[header_idx].lstrip("#").split(",")
-    data_lines = lines[header_idx + 1:]
-    idx = {}
-    for col in ("hostname", "ip", "countrylong", "countryshort", "openvpn_configdata_base64"):
-        for i, h in enumerate(header):
-            if h.strip().lstrip("*").lower() == col:
-                idx[col] = i
-                break
-    if "openvpn_configdata_base64" not in idx:
-        for i, h in enumerate(header):
-            if "base64" in h.lower():
-                idx["openvpn_configdata_base64"] = i
-                break
-    pos = {
-        "hostname": idx.get("hostname", 0),
-        "ip": idx.get("ip", 1),
-        "countrylong": idx.get("countrylong", 5),
-        "countryshort": idx.get("countryshort", 6),
-        "openvpn_configdata_base64": idx.get("openvpn_configdata_base64", len(header) - 1),
-    }
-
-    rows = []
-    for ln in data_lines:
-        try:
-            fields = next(csv.reader(io.StringIO(ln)))
-        except Exception:
-            continue
-        if len(fields) < 7: continue
-        host = fields[pos["hostname"]].strip()
-        ip = fields[pos["ip"]].strip()
-        if not host or not ip: continue
-        rows.append({
-            "host": host,
-            "ip": ip,
-            "country_long": fields[pos["countrylong"]].strip(),
-            "country_short": fields[pos["countryshort"]].strip(),
-            "config_b64": fields[pos["openvpn_configdata_base64"]].strip(),
-        })
-    return rows
+    die("无法从镜像源获取节点数据。")
 
 def parse_mirror_json(data):
     servers = []
