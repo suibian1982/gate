@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Gate 自动化家宽节点抓取与检测流水线 (语法修复版)
+VPN Gate 自动化家宽节点抓取与检测流水线 (极速鲁棒版)
 ================================================================
 通过 Cloudflare Worker (CheckSocks5) 远程检测节点，自动生成 nodes.txt。
 """
@@ -37,7 +37,10 @@ VPNGATE_MIRROR = os.environ.get(
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 
-CHECK_WORKER_HOST = os.environ.get("DOMAIN", "").strip()
+# 自动清洗 DOMAIN 密钥，剥离可能误填的 https:// 和尾随斜杠 /
+raw_domain = os.environ.get("DOMAIN", "").strip()
+raw_domain = re.sub(r"^https?://", "", raw_domain)
+CHECK_WORKER_HOST = raw_domain.rstrip("/")
 
 COUNTRY_ZH = {
     "JP": "日本", "KR": "韩国", "US": "美国", "CA": "加拿大", "RU": "俄罗斯",
@@ -206,9 +209,10 @@ def check_one_via_worker(node):
 
     check_url = f"https://{CHECK_WORKER_HOST}/check?lastp=vpn:vpn@{node['host']}:{node['port']}"
     try:
-        resp = requests.get(check_url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        resp = requests.get(check_url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
         if resp.status_code == 200:
             res_json = resp.json()
+            # 只要 Worker 正常返回，并且 success 为 true 代表节点可用
             if res_json.get("success") is True:
                 out["success"] = True
                 out["latency_ms"] = res_json.get("responseTime", 100)
@@ -239,7 +243,8 @@ def check_local_fallback(node):
 def check_all(nodes):
     results = []
     concurrency = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
-    log("WORKER CHECK", f"开始通过边缘 Worker 批量检测，并发数: {concurrency}, 总数: {len(nodes)}")
+    log("WORKER CHECK", f"当前使用的检测 Worker 域名: {CHECK_WORKER_HOST or '未配置(将使用本地直测)'}")
+    log("WORKER CHECK", f"开始批量检测，并发数: {concurrency}, 总数: {len(nodes)}")
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = [pool.submit(check_one_via_worker, n) for n in nodes]
         for fut in as_completed(futures):
@@ -302,7 +307,7 @@ def build_nodes_text(data, edge_hosts):
             n.get("host") or ""
         ))
         res_nodes = [n for n in nodes if n.get("residential") == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
+        dc_nodes = [n for n in nodes if n.get("residential"] != "residential"]
         for i, n in enumerate(res_nodes, 1):
             if edge:
                 entry = edge[idx % len(edge)]
