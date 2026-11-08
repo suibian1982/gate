@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-VPN Gate SSTP 节点检测流水线 (语法完美修复版)
+VPN Gate SSTP 节点检测流水线 (修正终极版)
 =========================================================
+基于本地 TCP 端口直测，融合 GitHub Actions 运行摘要输出与多源容灾。
 """
 
 from __future__ import annotations
@@ -165,7 +166,10 @@ def parse_csv(text):
 
     rows = []
     for ln in data_lines:
-        fields = next(csv.reader(io.StringIO(ln)))
+        try:
+            fields = next(csv.reader(io.StringIO(ln)))
+        except Exception:
+            continue
         if len(fields) < 7: continue
         host = fields[pos["hostname"]].strip()
         ip = fields[pos["ip"]].strip()
@@ -325,14 +329,14 @@ def build_outputs(results, raw_count, sstp_count, source, duration_s):
         "success": len(available),
         "failed": len(results) - len(available),
         "countries": len(countries),
-        "residential_est": sum(1 for n in available if n["residential"] == "residential"),
-        "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter"),
+        "residential_est": sum(1 for n in available if n.get("residential") == "residential"),
+        "datacenter_est": sum(1 for n in available if n.get("residential") == "datacenter"),
     }
     by_country = {}
     for name, grp in countries.items():
         grp["count"] = len(grp["nodes"])
-        grp["residential"] = sum(1 for n in grp["nodes"] if n["residential"] == "residential")
-        grp["datacenter"] = sum(1 for n in grp["nodes"] if n["residential"] == "datacenter")
+        grp["residential"] = sum(1 for n in grp["nodes"] if n.get("residential") == "residential")
+        grp["datacenter"] = sum(1 for n in grp["nodes"] if n.get("residential") == "datacenter")
         grp["nodes"].sort(key=lambda n: (
             0 if n.get("residential") == "residential" else 1,
             n.get("latency_ms") is None,
