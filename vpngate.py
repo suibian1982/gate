@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Gate SSTP 节点检测流水线 (强制镜像稳定版)
+VPN Gate SSTP 节点检测流水线 (名称错误修复版)
 =========================================================
 """
 
@@ -94,8 +94,39 @@ def die(msg):
     traceback.print_exc()
     sys.exit(1)
 
+def fetch_optimal_api_endpoints(api_urls_str):
+    if not api_urls_str.strip():
+        return []
+    endpoints = []
+    urls = [u.strip() for u in api_urls_str.split(",") if u.strip()]
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code == 200:
+                for line in resp.text.strip().splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"): continue
+                    endpoint = line.split("#")[0].strip()
+                    if endpoint:
+                        if ":" not in endpoint: endpoint = f"{endpoint}:443"
+                        endpoints.append(endpoint)
+        except Exception:
+            pass
+    return endpoints
+
+def get_combined_edge_hosts():
+    _entry = os.environ.get("HOSTS_ENTRY", "").strip()
+    static_hosts = [e.strip() for e in _entry.split(",") if e.strip()] if _entry else EDGE_HOSTS
+    api_hosts = fetch_optimal_api_endpoints(OPTIMAL_API)
+    combined = []
+    seen = set()
+    for h in static_hosts + api_hosts:
+        if h and h not in seen:
+            seen.add(h)
+            combined.append(h)
+    return combined if combined else EDGE_HOSTS
+
 def fetch_vpngate():
-    # 强制直接从稳定的 GitHub 镜像源获取数据，彻底规避官方 API 504 崩溃
     try:
         log("VPN GATE", f"正在请求稳定镜像源: {VPNGATE_MIRROR}")
         resp = requests.get(VPNGATE_MIRROR, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
