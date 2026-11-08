@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-VPN Gate SSTP 节点检测流水线 (高容错稳健版)
+VPN Gate SSTP 节点检测流水线 (强日志诊断版)
 =========================================================
 """
 
@@ -15,6 +15,7 @@ import re
 import socket
 import sys
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -92,10 +93,10 @@ def log(section, msg=""):
 
 def die(msg):
     log("FATAL", f"[失败] {msg}")
+    traceback.print_exc()
     sys.exit(1)
 
 def fetch_vpngate():
-    # 1. 尝试官方 API
     try:
         log("VPN GATE", f"正在请求官方 API: {VPNGATE_API}")
         resp = requests.get(
@@ -103,29 +104,29 @@ def fetch_vpngate():
             timeout=HTTP_TIMEOUT,
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         )
-        if resp.status_code == 200 and "HostName" in resp.text:
+        log("VPN GATE", f"官方 API 响应状态码: {resp.status_code}, 长度: {len(resp.text)}")
+        if resp.status_code == 200 and len(resp.text) > 100:
             rows = parse_csv(resp.text)
             if rows:
                 log("VPN GATE", f"官方 API 获取并解析成功，共 {len(rows)} 个节点")
                 return rows, "vpngate.net/api/iphone"
-        else:
-            log("VPN GATE", f"官方 API 返回异常状态码或非 CSV 数据 (Status: {resp.status_code})")
     except Exception as exc:
         log("VPN GATE", f"官方 API 请求异常: {exc}")
 
-    # 2. 尝试备用镜像源
     try:
         log("VPN GATE", f"切换至备用镜像源: {VPNGATE_MIRROR}")
         resp = requests.get(VPNGATE_MIRROR, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+        log("VPN GATE", f"备用镜像响应状态码: {resp.status_code}")
         if resp.status_code == 200:
-            rows = parse_mirror_json(resp.json())
+            data = resp.json()
+            rows = parse_mirror_json(data)
             if rows:
                 log("VPN GATE", f"备用镜像获取成功，共 {len(rows)} 个节点")
                 return rows, "github-mirror"
     except Exception as exc:
         log("VPN GATE", f"备用镜像请求异常: {exc}")
 
-    die("所有数据源（官方 API 与备用镜像）均获取失败，请检查网络或稍后重试。")
+    die("所有数据源（官方 API 与备用镜像）均获取失败。")
 
 def parse_csv(text):
     lines = [ln for ln in text.splitlines() if ln.strip()]
@@ -135,6 +136,7 @@ def parse_csv(text):
             header_idx = i
             break
     if header_idx is None:
+        log("PARSE CSV", "警告: 未在 CSV 中找到 HostName 表头")
         return []
 
     header = lines[header_idx].lstrip("#").split(",")
@@ -298,4 +300,153 @@ def build_outputs(results, raw_count, sstp_count, source, duration_s):
     for name, grp in countries.items():
         grp["count"] = len(grp["nodes"])
         grp["residential"] = sum(1 for n in grp["nodes"] if n.get("residential") == "residential")
-        grp["datacenter"] = sum(1 for n in grp["nodes
+        grp["datacenter"] = sum(1 for n in grp["nodes"] if n.get("residential") == "datacenter")
+        grp["nodes"].sort(key=lambda n: (
+            0 if n.get("residential") == "residential" else 1,
+            n.get("latency_ms") is None,
+            n.get("latency_ms") or 0,
+            n.get("host") or ""
+        ))
+        by_country[name] = grp
+
+    data = {
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "source": source,
+        "duration_s": round(duration_s, 1),
+        "worker": "python-native-tcp-check",
+        "stats": stats,
+        "countries": by_country,
+        "available": available,
+    }
+    return data
+
+def build_nodes_text(data, edge_hosts):
+    countries = data["countries"]
+    edge = edge_hosts
+    lines = []
+    idx = 0
+    ordered = sorted(countries.items(), key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
+    for cname, grp in ordered:
+        code = str(grp.get("code") or "?").upper()
+        zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
+        nodes = sorted(grp["nodes"], key=lambda n: (
+            0 if n.get("residential") == "residential" else 1,
+            n.get("latency_ms") is None,
+            n.get("latency_ms") or 0,
+            n.get("host") or ""
+        ))
+        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
+        dc_nodes = [n for n in nodes if n.get("residential"] != "residential"]
+        for i, n in enumerate(res_nodes, 1):
+            if edge:
+                entry = edge[idx % len(edge)]
+                idx += 1
+                lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            else:
+                lines.append(f"{n['host']}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+        for i, n in enumerate(dc_nodes, 1):
+            if edge:
+                entry = edge[idx % len(edge)]
+                idx += 1
+                lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            else:
+                lines.append(f"{n['host']}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+    return "\n".join(lines) + "\n"
+
+def atomic_write(path, text):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp_path = f"{path}.tmp-{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp_path, path)
+
+def write_step_summary(data, nodes_count):
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "").strip()
+    if not summary_path:
+        return
+    stats = data["stats"]
+    rows = [
+        "## check 摘要\n\n",
+        "| 指标 | 数值 |\n| :--- | ---: |\n",
+        f"| 原始节点 | {stats['raw_nodes']} |\n",
+        f"| SSTP 候选 | {stats['sstp_nodes']} |\n",
+        f"| 已检测 | {stats['checked']} |\n",
+        f"| 可用 | {stats['success']} |\n",
+        f"| 失败 | {stats['failed']}（Worker 异常 0）|\n",
+        f"| 国家/地区 | {stats['countries']} |\n",
+        f"| 住宅 / 机房 / 未知 | {stats['residential_est']} / {stats['datacenter_est']} / 0 |\n",
+        f"| 发布节点行数 | {nodes_count} |\n",
+        f"| 用时 | {data['duration_s']}s |\n",
+        f"| 数据源 | {data['source']} |\n\n",
+    ]
+    top = sorted(data["countries"].values(), key=lambda g: -g["count"])[:5]
+    if top:
+        rows.append("### 节点最多的 5 个国家/地区\n\n| 国家/地区 | 数量 | 住宅 |\n| :--- | ---: | ---: |\n")
+        for group in top:
+            c_code = group.get('code', '')
+            c_name = COUNTRY_ZH.get(c_code, group['name'])
+            rows.append(f"| {c_name}（{c_code}）| {group['count']} | {group['residential']} |\n")
+    rows.append(f"\n订阅地址：`{NODES_URL}`\n")
+    with open(summary_path, "a", encoding="utf-8") as f:
+        f.write("".join(rows))
+
+def write_outputs(data, edge_hosts):
+    os.makedirs(PUBLIC_DIR, exist_ok=True)
+    atomic_write(os.path.join(PUBLIC_DIR, ".nojekyll"), "")
+
+    data_path = os.path.join(PUBLIC_DIR, "data.json")
+    atomic_write(data_path, json.dumps(data, ensure_ascii=False, indent=1))
+
+    html_path = os.path.join(PUBLIC_DIR, "index.html")
+    if os.path.exists(TEMPLATE_HTML):
+        with open(TEMPLATE_HTML, "r", encoding="utf-8") as f:
+            html = f.read()
+    else:
+        html = "<html><head><meta charset='utf-8'><title>VPN Gate SSTP 节点</title></head><body><h1>VPN Gate SSTP 节点</h1></body></html>"
+    atomic_write(html_path, html)
+
+    nodes_path = os.path.join(PUBLIC_DIR, "nodes.txt")
+    nodes_text = build_nodes_text(data, edge_hosts)
+    atomic_write(nodes_path, nodes_text)
+
+    return data_path, html_path, nodes_path, nodes_text
+
+def main():
+    started = time.time()
+    rows, source = fetch_vpngate()
+    raw_count = len(rows)
+    if raw_count == 0: die("VPN Gate 返回 0 个有效原始节点")
+
+    sstp_nodes = to_sstp_nodes(rows)
+    sstp_count = len(sstp_nodes)
+    if sstp_count == 0: die("未解析出任何 SSTP 节点")
+    uniq = dedupe(sstp_nodes)
+
+    if MAX_CHECK_NODES > 0: uniq = uniq[:MAX_CHECK_NODES]
+
+    log("VPN GATE", f"获取原始节点: {raw_count}, SSTP 节点: {sstp_count}, 去重后: {len(uniq)}")
+    results = check_all(uniq)
+
+    success = [r for r in results if r.get("success")]
+    failed = [r for r in results if not r.get("success")]
+
+    log("TCP CHECK", f"检测成功: {len(success)}, 检测失败: {len(failed)}")
+
+    duration_s = time.time() - started
+    data = build_outputs(results, raw_count, sstp_count, source, duration_s)
+    edge_hosts = get_combined_edge_hosts()
+    data_path, html_path, nodes_path, nodes_text = write_outputs(data, edge_hosts)
+    
+    nodes_count = len([line for line in nodes_text.splitlines() if line.strip()])
+    write_step_summary(data, nodes_count)
+    log("WEBSITE", "完成文件生成与打包发布")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"程序运行异常捕获: {exc}")
+        traceback.print_exc()
+        sys.exit(1)
