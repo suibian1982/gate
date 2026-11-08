@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-VPN Gate SSTP 节点检测流水线 (完美恢复摘要报告版)
+VPN Gate SSTP 节点检测流水线 (终极融合修复版)
 =========================================================
-融合了本地高效 TCP 检测、多源容灾、原子写入以及 GitHub Actions 运行摘要表格报告。
+融合了高效本地 TCP 检测、多源容灾、原子写入、阿里云/阿里关键字识别及运行摘要报告。
 """
 
 from __future__ import annotations
@@ -368,8 +368,8 @@ def build_nodes_text(data, edge_hosts):
             n.get("latency_ms") or 0,
             n.get("host") or ""
         ))
-        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
+        res_nodes = [n for n in nodes if n.get("residential"] == "residential"]
+        dc_nodes = [n for n in nodes if n.get("residential"] != "residential"]
         for i, n in enumerate(res_nodes, 1):
             entry = edge[idx % len(edge)]
             idx += 1
