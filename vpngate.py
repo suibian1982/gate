@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-VPN Gate SSTP 节点检测流水线 (名称错误修复版)
-=========================================================
+VPN Gate 自动化家宽节点抓取与检测流水线 (小何爱分享架构专版)
+================================================================
+通过 Cloudflare Worker (CheckSocks5) 远程检测节点，自动生成 nodes.txt。
 """
 
 from __future__ import annotations
@@ -12,11 +13,9 @@ import io
 import json
 import os
 import re
-import socket
 import sys
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
@@ -29,16 +28,17 @@ for _stream in (sys.stdout, sys.stderr):
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# 稳定镜像源
 VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
 
-CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "64")))
-CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "6.0"))
-MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
+
+# 获取 GitHub Secrets 中配置的 DOMAIN (即 CheckSocks5 Worker 的域名，形如 check.xxx.workers.dev)
+CHECK_WORKER_HOST = os.environ.get("DOMAIN", "").strip()
 
 COUNTRY_ZH = {
     "JP": "日本", "KR": "韩国", "US": "美国", "CA": "加拿大", "RU": "俄罗斯",
@@ -136,11 +136,8 @@ def fetch_vpngate():
             if rows:
                 log("VPN GATE", f"镜像源获取并解析成功，共 {len(rows)} 个原始节点")
                 return rows, "github-mirror"
-        else:
-            log("VPN GATE", f"镜像源响应异常 (Status: {resp.status_code})")
     except Exception as exc:
         log("VPN GATE", f"镜像源请求异常: {exc}")
-
     die("无法从镜像源获取节点数据。")
 
 def parse_mirror_json(data):
@@ -198,49 +195,64 @@ def dedupe(nodes):
         out.append(n)
     return out
 
-def classify_network(host):
-    h = host.lower()
-    if h.startswith("public-vpn"): return "datacenter"
-    if re.match(r"^vpn\d{5,}", h) or re.match(r"^vpnv\d+", h): return "residential"
-    return "residential"
-
-def check_one(node):
+def check_one_via_worker(node):
+    """通过 CheckSocks5 Worker 检测节点连通性及属性"""
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
-    out["status"] = "failed"
     out["success"] = False
-    out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    out["exit"] = None
-    out["residential"] = classify_network(node["host"])
+    out["residential"] = "datacenter"
     
-    target_ip = node["ip"]
-    target_port = node["port"]
-    
-    t0 = time.time()
+    if not CHECK_WORKER_HOST:
+        # 如果没有配置 DOMAIN 密钥，默认退化为本地直测
+        return check_local_fallback(node)
+
+    check_url = f"https://{CHECK_WORKER_HOST}/check?lastp=vpn:vpn@{node['host']}:{node['port']}"
     try:
-        s = socket.create_connection((target_ip, target_port), timeout=CHECK_TIMEOUT)
-        s.close()
-        latency = int((time.time() - t0) * 1000)
-        
-        out["success"] = True
-        out["status"] = "success"
-        out["latency_ms"] = latency
-        out["error"] = None
-    except Exception as exc:
+        resp = requests.get(check_url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+        if resp.status_code == 200:
+            res_json = resp.json()
+            if res_json.get("success") is True:
+                out["success"] = True
+                out["latency_ms"] = res_json.get("responseTime", 100)
+                # 判断是否为家宽机房
+                exit_info = res_json.get("exit", {})
+                if exit_info.get("is_datacenter") is False:
+                    out["residential"] = "residential"
+                else:
+                    out["residential"] = "datacenter"
+        return out
+    except Exception:
         out["success"] = False
-        out["status"] = "failed"
-        out["error"] = str(exc)
-    
+        return out
+
+def check_local_fallback(node):
+    """本地 TCP 回退检测"""
+    out = dict(node)
+    out["success"] = False
+    out["residential"] = "residential"
+    try:
+        t0 = time.time()
+        s = socket.create_connection((node["ip"], node["port"]), timeout=5.0)
+        s.close()
+        out["success"] = True
+        out["latency_ms"] = int((time.time() - t0) * 1000)
+    except Exception:
+        out["success"] = False
     return out
 
 def check_all(nodes):
     results = []
-    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(check_one, n) for n in nodes]
+    concurrency = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
+    log("WORKER CHECK", f"开始通过边缘 Worker 批量检测，并发数: {concurrency}, 总数: {len(nodes)}")
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        futures = [pool.submit(check_one_via_worker, n) for n in nodes]
         for fut in as_completed(futures):
             results.append(fut.result())
     return results
+
+# 引入线程池导入
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def build_outputs(results, raw_count, sstp_count, source, duration_s):
     available = [r for r in results if r.get("success")]
@@ -267,7 +279,6 @@ def build_outputs(results, raw_count, sstp_count, source, duration_s):
         grp["datacenter"] = sum(1 for n in grp["nodes"] if n.get("residential") == "datacenter")
         grp["nodes"].sort(key=lambda n: (
             0 if n.get("residential") == "residential" else 1,
-            n.get("latency_ms") is None,
             n.get("latency_ms") or 0,
             n.get("host") or ""
         ))
@@ -277,7 +288,7 @@ def build_outputs(results, raw_count, sstp_count, source, duration_s):
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "source": source,
         "duration_s": round(duration_s, 1),
-        "worker": "python-native-tcp-check",
+        "worker": "cloudflare-worker-check",
         "stats": stats,
         "countries": by_country,
         "available": available,
@@ -295,12 +306,11 @@ def build_nodes_text(data, edge_hosts):
         zh = COUNTRY_ZH.get(code) or (code if code and code != "?" else cname)
         nodes = sorted(grp["nodes"], key=lambda n: (
             0 if n.get("residential") == "residential" else 1,
-            n.get("latency_ms") is None,
             n.get("latency_ms") or 0,
             n.get("host") or ""
         ))
-        res_nodes = [n for n in nodes if n.get("residential") == "residential"]
-        dc_nodes = [n for n in nodes if n.get("residential") != "residential"]
+        res_nodes = [n for n in nodes if n.get("residential"] == "residential"]
+        dc_nodes = [n for n in nodes if n.get("residential"] != "residential"]
         for i, n in enumerate(res_nodes, 1):
             if edge:
                 entry = edge[idx % len(edge)]
@@ -336,9 +346,9 @@ def write_step_summary(data, nodes_count):
         f"| SSTP 候选 | {stats['sstp_nodes']} |\n",
         f"| 已检测 | {stats['checked']} |\n",
         f"| 可用 | {stats['success']} |\n",
-        f"| 失败 | {stats['failed']}（Worker 异常 0）|\n",
+        f"| 失败 | {stats['failed']} |\n",
         f"| 国家/地区 | {stats['countries']} |\n",
-        f"| 住宅 / 机房 / 未知 | {stats['residential_est']} / {stats['datacenter_est']} / 0 |\n",
+        f"| 住宅 / 机房 | {stats['residential_est']} / {stats['datacenter_est']} |\n",
         f"| 发布节点行数 | {nodes_count} |\n",
         f"| 用时 | {data['duration_s']}s |\n",
         f"| 数据源 | {data['source']} |\n\n",
@@ -366,7 +376,7 @@ def write_outputs(data, edge_hosts):
         with open(TEMPLATE_HTML, "r", encoding="utf-8") as f:
             html = f.read()
     else:
-        html = "<html><head><meta charset='utf-8'><title>VPN Gate SSTP 节点</title></head><body><h1>VPN Gate SSTP 节点</h1></body></html>"
+        html = "<html><head><meta charset='utf-8'><title>VPN Gate 节点看板</title></head><body><h1>VPN Gate 优选节点</h1></body></html>"
     atomic_write(html_path, html)
 
     nodes_path = os.path.join(PUBLIC_DIR, "nodes.txt")
@@ -381,29 +391,28 @@ def main():
     raw_count = len(rows)
     if raw_count == 0: die("VPN Gate 返回 0 个有效原始节点")
 
-    sstp_nodes = to_sstp_nodes(rows)
+    sstp_nodes = to_stp_nodes_custom(rows) if 'to_stp_nodes_custom' in globals() else to_sstp_nodes(rows)
     sstp_count = len(sstp_nodes)
     if sstp_count == 0: die("未解析出任何 SSTP 节点")
     uniq = dedupe(sstp_nodes)
 
-    if MAX_CHECK_NODES > 0: uniq = uniq[:MAX_CHECK_NODES]
+    max_check = int(os.environ.get("MAX_CHECK_NODES", "0"))
+    if max_check > 0: uniq = uniq[:max_check]
 
-    log("VPN GATE", f"获取原始节点: {raw_count}, SSTP 节点: {sstp_count}, 去重后: {len(uniq)}")
+    log("VPN GATE", f"获取原始节点: {raw_count}, SSTP 候选: {sstp_count}, 去重后: {len(uniq)}")
     results = check_all(uniq)
 
     success = [r for r in results if r.get("success")]
-    failed = [r for r in results if not r.get("success")]
-
-    log("TCP CHECK", f"检测成功: {len(success)}, 检测失败: {len(failed)}")
+    log("CHECK RESULT", f"检测成功有效节点: {len(success)}")
 
     duration_s = time.time() - started
     data = build_outputs(results, raw_count, sstp_count, source, duration_s)
     edge_hosts = get_combined_edge_hosts()
-    data_path, html_path, nodes_path, nodes_text = write_outputs(data, edge_hosts)
+    _, _, _, nodes_text = write_outputs(data, edge_hosts)
     
     nodes_count = len([line for line in nodes_text.splitlines() if line.strip()])
     write_step_summary(data, nodes_count)
-    log("WEBSITE", "完成文件生成与打包发布")
+    log("WEBSITE", "完成全部节点检测、过滤与打包发布")
 
 if __name__ == "__main__":
     try:
@@ -411,6 +420,6 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as exc:
-        print(f"程序运行异常捕获: {exc}")
+        print(f"程序运行异常: {exc}")
         traceback.print_exc()
         sys.exit(1)
