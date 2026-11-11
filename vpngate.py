@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-VPN Gate 自动化家宽节点抓取与检测流水线 (智能双模兜底版)
+VPN Gate SSTP 候选抓取与 Worker 真实隧道检测版
 ================================================================
-支持边缘 Worker 检测，若失败自动降级为本地直测，确保 100% 产出可用节点。
+必须由 Cloudflare Worker 完成 SSTP 隧道和出口 IP 检测；不以 TCP 端口连通冒充 SSTP 成功。
 """
 
 from __future__ import annotations
@@ -13,10 +13,11 @@ import io
 import json
 import os
 import re
-import socket
 import sys
 import time
 import traceback
+import math
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -197,44 +198,91 @@ def dedupe(nodes):
         out.append(n)
     return out
 
+def get_worker_url() -> str:
+    """读取 Worker 地址。可设置 CHECK_WORKER_URL，或继续使用 DOMAIN。"""
+    explicit = os.environ.get("CHECK_WORKER_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    if not CHECK_WORKER_HOST:
+        return ""
+    return f"https://{CHECK_WORKER_HOST}/check"
+
+
+CHECK_WORKER_URL = get_worker_url()
+
+
 def check_one_node(node):
+    """只接受 Worker 完成 SSTP 隧道及出口查询后的真实成功结果。
+
+    注意：本地 TCP connect 成功不等于 SSTP 成功，因此不再使用 TCP 兜底。
+    """
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
     out["success"] = False
-    out["residential"] = "datacenter"
-    
-    # 优先尝试通过 Worker 远程检测
-    if CHECK_WORKER_HOST:
-        check_url = f"https://{CHECK_WORKER_HOST}/check?lastp=vpn:vpn@{node['host']}:{node['port']}"
-        try:
-            resp = requests.get(check_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code == 200:
-                res_json = resp.json()
-                if res_json.get("success") is True:
-                    out["success"] = True
-                    out["latency_ms"] = res_json.get("responseTime", 100)
-                    exit_info = res_json.get("exit", {})
-                    if exit_info.get("is_datacenter") is False:
-                        out["residential"] = "residential"
-                    else:
-                        out["residential"] = "datacenter"
-                    return out
-        except Exception:
-            pass # 远程 Worker 失败时自动静默降级到本地直测
+    out["latency_ms"] = -1
+    out["residential"] = "unknown"
+    out["check_error"] = "Worker 未配置"
 
-    # 降级：本地 TCP 直测兜底
+    if not CHECK_WORKER_URL:
+        return out
+
+    candidate = f"vpn:vpn@{node['host']}:{node['port']}"
+    timeout = max(5, int(os.environ.get("CHECK_TIMEOUT", "30")))
     try:
-        t0 = time.time()
-        s = socket.create_connection((node["ip"], node["port"]), timeout=4.0)
-        s.close()
+        # Worker 的实际接口参数是 sstp，不是 lastp。
+        resp = requests.get(
+            CHECK_WORKER_URL,
+            params={"sstp": candidate},
+            timeout=timeout,
+            headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+        )
+        resp.raise_for_status()
+        try:
+            result = resp.json()
+        except ValueError as exc:
+            raise RuntimeError(f"Worker 返回的不是 JSON：{resp.text[:200]}") from exc
+
+        if not isinstance(result, dict):
+            raise RuntimeError("Worker 返回格式错误：JSON 顶层不是对象")
+        if result.get("type") != "sstp":
+            raise RuntimeError(f"协议类型不匹配：{result.get('type')!r}")
+        if result.get("success") is not True:
+            raise RuntimeError(str(result.get("error") or "Worker 判定 SSTP 连接失败"))
+
+        latency = result.get("responseTime")
+        try:
+            latency = float(latency)
+        except (TypeError, ValueError):
+            raise RuntimeError("Worker 未返回有效 responseTime")
+        if not math.isfinite(latency) or latency < 0:
+            raise RuntimeError("Worker 返回的 responseTime 无效")
+
+        exit_info = result.get("exit")
+        if not isinstance(exit_info, dict):
+            raise RuntimeError("SSTP 虽返回 success，但缺少出口信息")
+        exit_ip = exit_info.get("ip") or exit_info.get("query")
+        if not exit_ip:
+            raise RuntimeError("Worker 出口查询未返回 IP，不能认定节点可用")
+
         out["success"] = True
-        out["latency_ms"] = int((time.time() - t0) * 1000)
-        out["residential"] = "residential"
+        out["latency_ms"] = round(latency, 1)
+        out["responseTime"] = round(latency, 1)
+        out["exit_ip"] = str(exit_ip)
+        out["exit"] = exit_info
+        out["check_error"] = ""
+        out["residential"] = (
+            "datacenter" if exit_info.get("is_datacenter") is True else
+            "residential" if exit_info.get("is_datacenter") is False else
+            "unknown"
+        )
         return out
-    except Exception:
-        out["success"] = False
-        return out
+
+    except requests.RequestException as exc:
+        out["check_error"] = f"Worker 请求失败：{exc}"
+    except Exception as exc:
+        out["check_error"] = str(exc)
+    return out
 
 def check_all(nodes):
     results = []
@@ -280,7 +328,7 @@ def build_outputs(results, raw_count, sstp_count, source, duration_s):
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
         "source": source,
         "duration_s": round(duration_s, 1),
-        "worker": "cloudflare-worker-check-with-fallback",
+        "worker": "cloudflare-worker-real-sstp-check",
         "stats": stats,
         "countries": by_country,
         "available": available,
@@ -395,8 +443,14 @@ def main():
     log("VPN GATE", f"获取原始节点: {raw_count}, SSTP 候选: {sstp_count}, 去重后: {len(uniq)}")
     results = check_all(uniq)
 
-    success = [r for r in results if r.get("success")]
-    log("CHECK RESULT", f"检测成功有效节点: {len(success)}")
+    success = [r for r in results if r.get("success") is True]
+    log("CHECK RESULT", f"检测成功有效节点: {len(success)} / {len(results)}")
+    if not success:
+        examples = [r.get("check_error", "未知错误") for r in results[:8]]
+        log("CHECK RESULT", "全部 SSTP 检测失败；为避免发布假节点，停止写入并保留旧数据。")
+        for i, reason in enumerate(examples, 1):
+            log("CHECK RESULT", f"失败样例 {i}: {reason}")
+        die("没有任何通过真实 SSTP 隧道和出口 IP 检测的节点")
 
     duration_s = time.time() - started
     data = build_outputs(results, raw_count, sstp_count, source, duration_s)
